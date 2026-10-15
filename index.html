@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src https://aqioskfuriffdopmqkmm.supabase.co; form-action 'none'; base-uri 'none'">
+<title>Taskmap sign-in</title>
+<!--
+  The consent page for Taskmap's Claude connector (Supabase Auth's OAuth 2.1
+  server). Supabase sends the browser here with ?authorization_id=...; the
+  page signs the owner in with email and password, shows which app is asking,
+  and sends Approve or Deny back to Supabase, which then returns the browser
+  to the app. Plain fetch, no library, nothing stored: the sign-in lives only
+  in this tab's memory. The only configuration inside is the project URL and
+  the publishable key, which tools/cloud/publish-signin.ps1 fills in.
+  Endpoints: facts.md section 1 (supabase-js GoTrueClient _getAuthorizationDetails,
+  _approveAuthorization, _denyAuthorization).
+-->
+<style>
+  :root { color-scheme: light dark; --bg: #f7f7f5; --card: #ffffff; --ink: #1d1d1b; --muted: #5d5d58; --line: #d9d9d3; --accent: #2f5d50; --accent-ink: #ffffff; --danger: #9b2c2c; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #161615; --card: #20201e; --ink: #ecece8; --muted: #a5a59f; --line: #3a3a36; --accent: #7fb8a4; --accent-ink: #10201b; --danger: #f08c8c; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: var(--bg); color: var(--ink); font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; padding: 16px; }
+  main { width: 100%; max-width: 380px; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 24px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  p { margin: 8px 0; }
+  .muted { color: var(--muted); font-size: 14px; }
+  label { display: block; font-size: 14px; margin: 14px 0 4px; }
+  input { width: 100%; font: inherit; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: inherit; }
+  .row { display: flex; gap: 8px; margin-top: 20px; }
+  button { flex: 1; font: inherit; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line); background: transparent; color: inherit; cursor: pointer; }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  button:disabled { opacity: .6; cursor: default; }
+  .error { color: var(--danger); font-size: 14px; min-height: 1.5em; }
+  dl { margin: 12px 0 0; font-size: 14px; }
+  dt { color: var(--muted); }
+  dd { margin: 0 0 8px; overflow-wrap: anywhere; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Taskmap</h1>
+  <p id="status" class="muted" aria-live="polite">Loading…</p>
+
+  <section id="signin" hidden>
+    <p>Sign in with the Taskmap account (the one created for Taskmap in Supabase, not your Supabase dashboard login).</p>
+    <form id="signin-form" novalidate>
+      <label for="email">Email</label>
+      <input id="email" type="email" autocomplete="username" required>
+      <label for="password">Password</label>
+      <input id="password" type="password" autocomplete="current-password" required>
+      <div class="row"><button id="signin-button" class="primary" type="submit">Sign in</button></div>
+    </form>
+  </section>
+
+  <section id="consent" hidden>
+    <p><strong id="client-name"></strong> is asking to read your Taskmap copy and send it changes.</p>
+    <dl>
+      <dt>Signed in as</dt><dd id="user-email"></dd>
+      <dt>It returns to</dt><dd id="redirect-host"></dd>
+      <dt>Access asked for</dt><dd id="scopes"></dd>
+    </dl>
+    <div class="row">
+      <button id="deny" type="button">Deny</button>
+      <button id="approve" class="primary" type="button">Approve</button>
+    </div>
+  </section>
+
+  <p id="error" class="error" role="alert"></p>
+</main>
+<script>
+"use strict";
+(function () {
+  var SUPABASE_URL = "https://aqioskfuriffdopmqkmm.supabase.co";
+  var PUBLISHABLE_KEY = "sb_publishable_CbfXuSqvUIFlH_o-c86kaQ_GUo3B7Ib";
+  var AUTH = SUPABASE_URL.replace(/\/+$/, "") + "/auth/v1";
+  var $ = function (id) { return document.getElementById(id); };
+  var accessToken = null;
+  var authorizationId = new URLSearchParams(window.location.search).get("authorization_id");
+
+  function status(text) { $("status").textContent = text; }
+  function fail(text) { $("error").textContent = text; }
+  function show(id) { ["signin", "consent"].forEach(function (s) { $(s).hidden = s !== id; }); }
+
+  // Never inside a frame: the Approve button must not be clickable through another page.
+  if (window.top !== window.self) { status("This page cannot be shown inside another page."); return; }
+  if (SUPABASE_URL.indexOf("%%") === 0 || PUBLISHABLE_KEY.indexOf("%%") === 0) { status("This page has not been set up yet (publish it with tools/cloud/publish-signin.ps1)."); return; }
+  if (!authorizationId || !/^[A-Za-z0-9_-]{1,200}$/.test(authorizationId)) { status("Nothing to approve here. Start from Claude's connector settings."); return; }
+
+  function headers() {
+    var h = { "apikey": PUBLISHABLE_KEY, "Content-Type": "application/json", "X-Supabase-Api-Version": "2024-01-01" };
+    if (accessToken) h["Authorization"] = "Bearer " + accessToken;
+    return h;
+  }
+  function call(method, path, body) {
+    return fetch(AUTH + path, { method: method, headers: headers(), body: body ? JSON.stringify(body) : undefined, credentials: "omit", cache: "no-store" })
+      .then(function (res) {
+        return res.text().then(function (text) {
+          var data = null;
+          try { data = text ? JSON.parse(text) : null; } catch (e) { data = null; }
+          if (!res.ok) {
+            var message = (data && (data.msg || data.message || data.error_description || data.error)) || ("HTTP " + res.status);
+            throw new Error(String(message));
+          }
+          return data || {};
+        });
+      });
+  }
+  // Only ever leave for the address Supabase gave: https, or http on this computer (an MCP inspector).
+  function leave(url) {
+    var target;
+    try { target = new URL(url); } catch (e) { fail("Supabase returned an unreadable address."); return; }
+    var local = target.hostname === "localhost" || target.hostname === "127.0.0.1";
+    if (target.protocol !== "https:" && !(target.protocol === "http:" && local)) { fail("Supabase returned an address that is not secure; stopped."); return; }
+    status("Returning to " + target.host + "…");
+    window.location.replace(target.href);
+  }
+
+  function loadDetails() {
+    status("Checking the request…");
+    return call("GET", "/oauth/authorizations/" + encodeURIComponent(authorizationId)).then(function (data) {
+      if (!data.authorization_id && data.redirect_url) { leave(data.redirect_url); return; }
+      var client = data.client || {};
+      $("client-name").textContent = client.name || client.id || "An app";
+      $("user-email").textContent = (data.user && data.user.email) || "";
+      var host = "";
+      try { host = new URL(data.redirect_uri).host; } catch (e) { host = String(data.redirect_uri || ""); }
+      $("redirect-host").textContent = host;
+      $("scopes").textContent = data.scope || "(none named)";
+      status("");
+      show("consent");
+      $("approve").focus();
+    });
+  }
+  function decide(action) {
+    $("approve").disabled = true; $("deny").disabled = true; fail("");
+    status(action === "approve" ? "Approving…" : "Denying…");
+    call("POST", "/oauth/authorizations/" + encodeURIComponent(authorizationId) + "/consent", { action: action })
+      .then(function (data) {
+        if (data.redirect_url) leave(data.redirect_url);
+        else { status(action === "approve" ? "Approved. You can close this tab." : "Denied. You can close this tab."); }
+      })
+      .catch(function (error) { $("approve").disabled = false; $("deny").disabled = false; status(""); fail("That did not go through: " + error.message); });
+  }
+
+  $("signin-form").addEventListener("submit", function (event) {
+    event.preventDefault();
+    fail("");
+    var email = $("email").value.trim(), password = $("password").value;
+    if (!email || !password) { fail("Enter the email and password."); return; }
+    $("signin-button").disabled = true;
+    status("Signing in…");
+    call("POST", "/token?grant_type=password", { email: email, password: password })
+      .then(function (data) {
+        $("password").value = "";
+        if (!data.access_token) throw new Error("No session came back.");
+        accessToken = data.access_token;
+        return loadDetails();
+      })
+      .catch(function (error) { $("signin-button").disabled = false; status(""); fail("Sign-in failed: " + error.message); });
+  });
+  $("approve").addEventListener("click", function () { decide("approve"); });
+  $("deny").addEventListener("click", function () { decide("deny"); });
+
+  status("");
+  show("signin");
+  $("email").focus();
+})();
+</script>
+</body>
+</html>
